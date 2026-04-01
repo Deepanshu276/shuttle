@@ -68,6 +68,7 @@ class RouteStopRead(BaseModel):
     eta_minutes: int
     passenger_delta: int
     load_after_stop: int
+    visited: bool
 
 
 class RouteRead(BaseModel):

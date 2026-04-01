@@ -115,6 +115,12 @@ REFERENCE_VEHICLES = [
     ),
 ]
 
+VEHICLE_HOME_POSITIONS: dict[str, tuple[float, float]] = {
+    "van-orbit-1": (17.4362, 78.3665),
+    "van-orbit-2": (17.4371, 78.3672),
+    "van-orbit-3": (17.4386, 78.3695),
+}
+
 
 def ensure_reference_data(session: Session) -> None:
     existing_stop_count = session.exec(select(CampusStop)).first()
@@ -137,14 +143,14 @@ def reset_demo_state(session: Session) -> None:
     session.commit()
 
     vehicles = session.exec(select(Vehicle)).all()
-    vehicle_templates = {vehicle.id: vehicle for vehicle in REFERENCE_VEHICLES}
     for vehicle in vehicles:
-        template = vehicle_templates[vehicle.id]
-        vehicle.status = VehicleStatus.IDLE
-        vehicle.current_latitude = template.current_latitude
-        vehicle.current_longitude = template.current_longitude
-        vehicle.last_updated_at = datetime.utcnow()
-        session.add(vehicle)
+        home = VEHICLE_HOME_POSITIONS.get(vehicle.id)
+        if home:
+            vehicle.status = VehicleStatus.IDLE
+            vehicle.current_latitude = home[0]
+            vehicle.current_longitude = home[1]
+            vehicle.last_updated_at = datetime.utcnow()
+            session.add(vehicle)
 
     session.commit()
 

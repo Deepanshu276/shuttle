@@ -52,4 +52,6 @@ export const api = {
     request<DemoScenario>('/demo/scenario/morning-rush', {
       method: 'POST',
     }),
+  reoptimizeRoute: (routeId: number) =>
+    request<Route>(`/routes/${routeId}/reoptimize`, { method: 'POST' }),
 }

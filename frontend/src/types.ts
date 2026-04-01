@@ -64,6 +64,7 @@ export interface RouteStop {
   eta_minutes: number
   passenger_delta: number
   load_after_stop: number
+  visited: boolean
 }
 
 export interface Route {

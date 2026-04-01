@@ -104,3 +104,4 @@ class RouteStop(SQLModel, table=True):
     eta_minutes: int
     passenger_delta: int
     load_after_stop: int
+    visited: bool = Field(default=False)

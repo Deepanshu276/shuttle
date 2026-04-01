@@ -272,6 +272,21 @@ export function OpsPage() {
                     </li>
                   ))}
                 </ol>
+                <div style={{ marginTop: '0.75rem' }}>
+                  <button
+                    className="button button--secondary"
+                    type="button"
+                    disabled={busyAction !== null}
+                    onClick={() =>
+                      void runAction(`reoptimize-${route.id}`, async () => {
+                        await api.reoptimizeRoute(route.id)
+                        setBanner(`Route ${route.id} re-optimized with current demand.`)
+                      })
+                    }
+                  >
+                    {busyAction === `reoptimize-${route.id}` ? 'Optimizing...' : 'Re-optimize'}
+                  </button>
+                </div>
               </article>
             ))
           ) : (

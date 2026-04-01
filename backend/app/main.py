@@ -25,6 +25,7 @@ from app.services.dispatch import (
     list_requests,
     list_routes,
     list_vehicles,
+    reoptimize_route,
     run_dispatch,
     sync_completed_requests,
 )
@@ -120,6 +121,17 @@ def get_request(
 def get_routes(session: Session = Depends(get_session)) -> list[RouteRead]:
     sync_completed_requests(session)
     return list_routes(session)
+
+
+@api.post("/routes/{route_id}/reoptimize", response_model=RouteRead)
+def trigger_reoptimize(
+    route_id: int,
+    session: Session = Depends(get_session),
+) -> RouteRead:
+    try:
+        return reoptimize_route(route_id, session)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @api.get("/vehicles", response_model=list[VehicleRead])

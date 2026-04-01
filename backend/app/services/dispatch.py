@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlmodel import Session, delete, select
 
@@ -144,6 +144,7 @@ def nearest_neighbor_order(
     stops_by_id: dict[str, CampusStop],
     start_latitude: float,
     start_longitude: float,
+    demand_by_stop_id: dict[str, int] | None = None,
 ) -> list[str]:
     remaining = pickup_ids[:]
     ordered: list[str] = []
@@ -151,15 +152,13 @@ def nearest_neighbor_order(
     current_longitude = start_longitude
 
     while remaining:
-        next_stop_id = min(
-            remaining,
-            key=lambda stop_id: haversine_km(
-                current_latitude,
-                current_longitude,
-                stops_by_id[stop_id].latitude,
-                stops_by_id[stop_id].longitude,
-            ),
-        )
+        def score(stop_id: str, _lat: float = current_latitude, _lng: float = current_longitude) -> float:
+            dist = haversine_km(_lat, _lng, stops_by_id[stop_id].latitude, stops_by_id[stop_id].longitude)
+            if demand_by_stop_id is None:
+                return dist
+            return dist / max(demand_by_stop_id.get(stop_id, 1), 1)
+
+        next_stop_id = min(remaining, key=score)
         ordered.append(next_stop_id)
         current_latitude = stops_by_id[next_stop_id].latitude
         current_longitude = stops_by_id[next_stop_id].longitude
@@ -322,6 +321,7 @@ def build_route(
         stops_by_id,
         vehicle.current_latitude,
         vehicle.current_longitude,
+        demand_by_stop_id=dict(pickup_loads),
     )
 
     route = Route(
@@ -428,6 +428,139 @@ def build_route(
     return route
 
 
+def reoptimize_route(route_id: int, session: Session) -> RouteRead:
+    route = session.get(Route, route_id)
+    if route is None:
+        raise ValueError(f"Route {route_id} not found.")
+
+    vehicle = session.get(Vehicle, route.vehicle_id)
+    if vehicle is None:
+        raise ValueError(f"Vehicle {route.vehicle_id} not found.")
+
+    all_stops = session.exec(
+        select(RouteStop).where(RouteStop.route_id == route_id).order_by(RouteStop.sequence)
+    ).all()
+
+    dest_rs = next((rs for rs in all_stops if rs.stop_type == StopKind.DESTINATION), None)
+    unvisited_pickups = [rs for rs in all_stops if rs.stop_type == StopKind.PICKUP and not rs.visited]
+
+    if not unvisited_pickups:
+        return next(r for r in list_routes(session) if r.id == route_id)
+
+    stops = session.exec(select(CampusStop)).all()
+    stops_by_id = {s.id: s for s in stops}
+
+    existing = session.exec(
+        select(RideRequest).where(
+            RideRequest.assigned_route_id == route_id,
+            RideRequest.status != RequestStatus.DROPPED,
+        )
+    ).all()
+    arrival_buckets = {bucketize_arrival_window(rr.desired_arrival_at) for rr in existing}
+
+    new_requests: list[RideRequest] = []
+    for bucket in arrival_buckets:
+        bucket_end = bucket + timedelta(minutes=15)
+        candidates = session.exec(
+            select(RideRequest).where(
+                RideRequest.destination_stop_id == route.destination_stop_id,
+                RideRequest.status == RequestStatus.REQUESTED,
+                RideRequest.assigned_route_id == None,  # noqa: E711
+                RideRequest.desired_arrival_at >= bucket,
+                RideRequest.desired_arrival_at < bucket_end,
+            )
+        ).all()
+        new_requests.extend(candidates)
+
+    demand: dict[str, int] = {}
+    for rs in unvisited_pickups:
+        demand[rs.stop_id] = demand.get(rs.stop_id, 0) + rs.passenger_delta
+
+    remaining_capacity = vehicle.seat_capacity - route.occupancy
+    assignable_new: list[RideRequest] = []
+    seats_used = 0
+    for req in new_requests:
+        if seats_used + req.passenger_count <= remaining_capacity:
+            assignable_new.append(req)
+            seats_used += req.passenger_count
+            demand[req.pickup_stop_id] = demand.get(req.pickup_stop_id, 0) + req.passenger_count
+
+    active_stop_ids = [sid for sid, cnt in demand.items() if cnt > 0]
+    reordered = nearest_neighbor_order(
+        active_stop_ids,
+        stops_by_id,
+        vehicle.current_latitude,
+        vehicle.current_longitude,
+        demand_by_stop_id=demand,
+    )
+
+    visited_seqs = [rs.sequence for rs in all_stops if rs.stop_type == StopKind.PICKUP and rs.visited]
+    visited_etas = [rs.eta_minutes for rs in all_stops if rs.stop_type == StopKind.PICKUP and rs.visited]
+    next_seq = max(visited_seqs, default=0) + 1
+    elapsed = max(visited_etas, default=0)
+
+    unvisited_by_stop: dict[str, RouteStop] = {rs.stop_id: rs for rs in unvisited_pickups}
+    cur_lat, cur_lng = vehicle.current_latitude, vehicle.current_longitude
+    running_load = route.occupancy
+    geometry: list[dict[str, float]] = [{"latitude": cur_lat, "longitude": cur_lng}]
+
+    for stop_id in reordered:
+        stop = stops_by_id[stop_id]
+        elapsed += estimate_drive_minutes(haversine_km(cur_lat, cur_lng, stop.latitude, stop.longitude))
+        pax = demand[stop_id]
+        running_load += pax
+
+        if stop_id in unvisited_by_stop:
+            rs = unvisited_by_stop[stop_id]
+            rs.sequence = next_seq
+            rs.eta_minutes = elapsed
+            rs.passenger_delta = pax
+            rs.load_after_stop = running_load
+            session.add(rs)
+        else:
+            session.add(RouteStop(
+                route_id=route_id,
+                stop_id=stop_id,
+                sequence=next_seq,
+                stop_type=StopKind.PICKUP,
+                eta_minutes=elapsed,
+                passenger_delta=pax,
+                load_after_stop=running_load,
+                visited=False,
+            ))
+
+        for req in assignable_new:
+            if req.pickup_stop_id == stop_id:
+                req.assigned_route_id = route_id
+                req.assigned_vehicle_id = vehicle.id
+                req.pickup_eta_minutes = elapsed
+                req.status = RequestStatus.MATCHED
+                session.add(req)
+
+        geometry.append({"latitude": stop.latitude, "longitude": stop.longitude})
+        cur_lat, cur_lng = stop.latitude, stop.longitude
+        next_seq += 1
+
+    if dest_rs is not None:
+        dest = stops_by_id[dest_rs.stop_id]
+        elapsed += estimate_drive_minutes(haversine_km(cur_lat, cur_lng, dest.latitude, dest.longitude))
+        dest_rs.sequence = next_seq
+        dest_rs.eta_minutes = elapsed
+        dest_rs.passenger_delta = -running_load
+        dest_rs.load_after_stop = 0
+        session.add(dest_rs)
+        geometry.append({"latitude": dest.latitude, "longitude": dest.longitude})
+
+    route.estimated_duration_minutes = elapsed + 2
+    route.updated_at = datetime.utcnow()
+    route.geometry_json = json.dumps(geometry)
+    session.add(route)
+    session.commit()
+    session.refresh(route)
+
+    return next(r for r in list_routes(session) if r.id == route_id)
+
+
 def list_requests(session: Session) -> list[RideRequestRead]:
     stops = session.exec(select(CampusStop)).all()
     stops_by_id = {stop.id: stop for stop in stops}
@@ -506,6 +639,7 @@ def list_routes(session: Session) -> list[RouteRead]:
                 eta_minutes=route_stop.eta_minutes,
                 passenger_delta=route_stop.passenger_delta,
                 load_after_stop=route_stop.load_after_stop,
+                visited=route_stop.visited,
             )
             for route_stop in route_stops
         ]
